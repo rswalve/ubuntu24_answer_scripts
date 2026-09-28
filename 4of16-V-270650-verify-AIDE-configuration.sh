@@ -8,7 +8,11 @@ set -euo pipefail
 # Usage:
 #   ./V-270650-verify-AIDE-configuration.sh i-0123456789abcdef0
 #   ./V-270650-verify-AIDE-configuration.sh i-0123456789abcdef0 us-gov-west-1
-# Optional: AIDE_CHECK_TIMEOUT=180
+# Optional:
+#   AIDE_CHECK_TIMEOUT=900          seconds for aide --check on the instance (default 900)
+#   SKIP_AIDE_FULL_CHECK=1          skip the long scan; only verify package/conf/DB
+#   SSM_WAIT_ATTEMPTS=90            poll loops (default 90)
+#   SSM_WAIT_SLEEP=10               seconds between polls (default 10)
 
 if [ $# -lt 1 ]; then
   echo "Usage: $0 <instance-id> [region]" >&2
@@ -18,7 +22,10 @@ fi
 INSTANCE_ID="$1"
 REGION="${2:-${AWS_DEFAULT_REGION:-us-gov-west-1}}"
 BUCKET_NAME="idcs-management-core-devops"
-AIDE_CHECK_TIMEOUT="${AIDE_CHECK_TIMEOUT:-180}"
+AIDE_CHECK_TIMEOUT="${AIDE_CHECK_TIMEOUT:-900}"
+SKIP_AIDE_FULL_CHECK="${SKIP_AIDE_FULL_CHECK:-0}"
+SSM_WAIT_ATTEMPTS="${SSM_WAIT_ATTEMPTS:-90}"
+SSM_WAIT_SLEEP="${SSM_WAIT_SLEEP:-10}"
 
 RANDOM_ID=$(head -c 16 /dev/urandom | xxd -p)
 SCRIPT_NAME="verify_V-270650_${RANDOM_ID}.sh"
@@ -45,6 +52,7 @@ cat << EOF > "$LOCAL_TMP_SCRIPT"
 #!/usr/bin/env bash
 set -eo pipefail
 AIDE_CHECK_TIMEOUT='$AIDE_CHECK_TIMEOUT'
+SKIP_AIDE_FULL_CHECK='$SKIP_AIDE_FULL_CHECK'
 
 echo "=== Verifying V-270650 AIDE configuration ==="
 HOST_FQDN=\$(hostname -f 2>/dev/null || hostname)
@@ -88,16 +96,30 @@ AIDE_RC=na
 AIDE_OUT="[not run]"
 
 if [ "\$AIDE_PKG" = installed ] || [ -n "\$AIDE_BIN" ]; then
-  if [ -n "\$CONF" ]; then
-    CMD="aide -c \$CONF --check"
+  if [ "\$SKIP_AIDE_FULL_CHECK" = 1 ]; then
+    echo "[INFO] SKIP_AIDE_FULL_CHECK=1 — not running full aide --check"
+    AIDE_OUT="[skipped full check]"
+    if [ -n "\$AIDE_BIN" ] && [ -n "\$CONF" ] && [ "\$DB_FILES" != none ]; then
+      AIDE_RC=0
+    elif [ -n "\$AIDE_BIN" ] && [ -n "\$CONF" ]; then
+      AIDE_RC=2
+      AIDE_OUT="[skipped] AIDE binary and conf present but no database file under /var/lib/aide"
+    else
+      AIDE_RC=2
+      AIDE_OUT="[skipped] AIDE installed but conf or binary missing"
+    fi
   else
-    CMD="aide --check"
+    if [ -n "\$CONF" ]; then
+      CMD="aide -c \$CONF --check"
+    else
+      CMD="aide --check"
+    fi
+    echo "[INFO] running: \$CMD (timeout \${AIDE_CHECK_TIMEOUT}s)"
+    set +e
+    AIDE_OUT=\$(timeout "\$AIDE_CHECK_TIMEOUT" \$CMD 2>&1)
+    AIDE_RC=\$?
+    set -e
   fi
-  echo "[INFO] running: \$CMD (timeout \${AIDE_CHECK_TIMEOUT}s)"
-  set +e
-  AIDE_OUT=\$(timeout "\$AIDE_CHECK_TIMEOUT" \$CMD 2>&1)
-  AIDE_RC=\$?
-  set -e
 fi
 
 AIDE_OUT_ONE=\$(printf '%s' "\$AIDE_OUT" | tr '\n' ' ' | cut -c1-400)
@@ -143,7 +165,7 @@ COMMAND_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --comment "Verify STIG V-270650 (AIDE configured)" \
-  --timeout-seconds 300 \
+  --timeout-seconds 1200 \
   --parameters "commands=[\"$ONE_LINER\"]" \
   --query "Command.CommandId" \
   --output text)
@@ -151,8 +173,12 @@ COMMAND_ID=$(aws ssm send-command \
 STATUS="Pending"; ATTEMPT=0
 while [[ "$STATUS" == "Pending" || "$STATUS" == "InProgress" || "$STATUS" == "Delayed" ]]; do
   ATTEMPT=$((ATTEMPT + 1))
-  [ "$ATTEMPT" -gt 40 ] && echo "[ERROR] SSM timeout" >&2 && exit 1
-  sleep 5
+  if [ "$ATTEMPT" -gt "$SSM_WAIT_ATTEMPTS" ]; then
+    echo "[ERROR] SSM timeout after $((ATTEMPT * SSM_WAIT_SLEEP))s. Re-run with SKIP_AIDE_FULL_CHECK=1 or raise SSM_WAIT_ATTEMPTS / AIDE_CHECK_TIMEOUT." >&2
+    echo "[INFO] CommandId=$COMMAND_ID — you can still poll: aws ssm get-command-invocation --command-id $COMMAND_ID --instance-id $INSTANCE_ID --region $REGION" >&2
+    exit 1
+  fi
+  sleep "$SSM_WAIT_SLEEP"
   STATUS=$(aws ssm get-command-invocation --region "$REGION" --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query "Status" --output text 2>/dev/null || echo "Pending")
 done
 

@@ -3,52 +3,61 @@ set -euo pipefail
 
 # Script: V-270711-verify-the-x84-Ctrl-Alt-Delete-is-disabled.sh
 # STIG:   Ubuntu 24.04 LTS — V-270711 / SV-270711r1184069 / UBTU-24-300025
-# Rule:   Disable the x86 Ctrl-Alt-Delete key sequence if a GUI is installed.
+# Transport: AWS SSM (same pattern as v-284944-verify-rsyslog-service-running.sh)
 #
-# Usage (run from jumpserver):
-#   ./V-270711-verify-the-x84-Ctrl-Alt-Delete-is-disabled.sh ubuntu@10.0.1.25
-#   ./V-270711-verify-the-x84-Ctrl-Alt-Delete-is-disabled.sh -i ~/.ssh/id_rsa ubuntu@i-0123.example
-#
-# Usage (run directly on the audited host):
-#   ./V-270711-verify-the-x84-Ctrl-Alt-Delete-is-disabled.sh
-#
-# Extra args after the target are passed through to ssh (e.g. -i key, -p 22).
+# Usage (Git Bash / jump server with AWS creds already configured):
+#   ./V-270711-verify-the-x84-Ctrl-Alt-Delete-is-disabled.sh i-0123456789abcdef0
+#   ./V-270711-verify-the-x84-Ctrl-Alt-Delete-is-disabled.sh i-0123456789abcdef0 us-gov-west-1
 
-SSH_TARGET=""
-SSH_OPTS=()
-
-if [ $# -ge 1 ]; then
-  # First non-option argument is treated as [user@]host
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      -*)
-        SSH_OPTS+=("$1")
-        if [ $# -ge 2 ] && [[ "$2" != -* ]]; then
-          case "$1" in
-            -i|-p|-o|-l|-F|-J|-b|-c|-D|-E|-e|-L|-R|-W|-w)
-              SSH_OPTS+=("$2")
-              shift
-              ;;
-          esac
-        fi
-        shift
-        ;;
-      *)
-        SSH_TARGET="$1"
-        shift
-        SSH_OPTS+=("$@")
-        break
-        ;;
-    esac
-  done
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 <instance-id> [region]" >&2
+  echo "Example: $0 i-0123456789abcdef0 us-gov-west-1" >&2
+  exit 1
 fi
 
-REMOTE_SCRIPT=$(cat <<'EOS'
-set -euo pipefail
+INSTANCE_ID="$1"
+REGION="${2:-${AWS_DEFAULT_REGION:-us-gov-west-1}}"
+BUCKET_NAME="idcs-management-core-devops"
+
+RANDOM_ID=$(head -c 16 /dev/urandom | xxd -p)
+SCRIPT_NAME="verify_V-270711_${RANDOM_ID}.sh"
+S3_KEY="tmp/${SCRIPT_NAME}"
+LOCAL_TMP_SCRIPT="/tmp/${SCRIPT_NAME}"
+
+cleanup() {
+  echo "[INFO] Cleaning up staging artifacts..." >&2
+  aws s3 rm "s3://${BUCKET_NAME}/${S3_KEY}" --region "$REGION" >/dev/null 2>&1 || true
+  rm -f "$LOCAL_TMP_SCRIPT" || true
+}
+trap cleanup EXIT
+
+if ! INSTANCE_DATA=$(aws ec2 describe-instances \
+  --region "$REGION" \
+  --instance-ids "$INSTANCE_ID" \
+  --query "Reservations[0].Instances[0].{Tags:Tags}" \
+  --output json 2>/dev/null); then
+  echo "[ERROR] Failed to describe instance $INSTANCE_ID in region $REGION." >&2
+  echo "[ERROR] Check AWS credentials (aws sts get-caller-identity) and region." >&2
+  exit 1
+fi
+
+HOSTNAME_TAG=$(aws ec2 describe-instances \
+  --region "$REGION" \
+  --instance-ids "$INSTANCE_ID" \
+  --query "Reservations[0].Instances[0].Tags[?Key=='Hostname' || Key=='hostname' || Key=='HOSTNAME'].Value | [0]" \
+  --output text)
+
+cat << 'EOF' > "$LOCAL_TMP_SCRIPT"
+#!/usr/bin/env bash
+set -eo pipefail
+
+echo "=== Verifying V-270711 Ctrl-Alt-Delete graphical binding ==="
 
 HOST_FQDN=$(hostname -f 2>/dev/null || hostname)
 HOST_SHORT=$(hostname -s 2>/dev/null || hostname)
 OS_PRETTY=$(grep -E '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' || echo "unknown")
+echo "[INFO] Host: $HOST_FQDN ($HOST_SHORT)"
+echo "[INFO] OS:   $OS_PRETTY"
 
 GSETTINGS_BIN=$(command -v gsettings || true)
 GNOME_PKGS=$(dpkg-query -W -f='${Package}\t${Status}\n' \
@@ -86,70 +95,99 @@ if [ -n "$GNOME_PKGS" ] || [ "$DCONF_PROFILE_EXISTS" = "yes" ] || [ "$SCHEMA_PRE
   GUI_PRESENT="yes"
 fi
 
-STATUS=""
-RATIONALE=""
+echo "[INFO] GUI present:          $GUI_PRESENT"
+echo "[INFO] GNOME packages:       ${GNOME_PKGS:-none}"
+echo "[INFO] dconf profile exists: $DCONF_PROFILE_EXISTS"
+echo "[INFO] gsettings binary:     ${GSETTINGS_BIN:-none}"
+echo "[INFO] media-keys schema:    $SCHEMA_PRESENT"
+echo "[INFO] gsettings result:     $GSETTINGS_RAW"
+echo "[INFO] gsettings exit code:  $GSETTINGS_RC"
+echo "[INFO] Expected compliant:   @as []"
 
 if [ "$GUI_PRESENT" = "no" ]; then
-  STATUS="Not Applicable"
-  RATIONALE="No GNOME/desktop packages, dconf user profile, or media-keys schema present. Rule applies only when a graphical user interface is installed."
+  echo "[SUCCESS] Not Applicable — no GNOME/desktop/dconf/media-keys schema on this host."
+  echo "CKL_STATUS=Not Applicable"
+  echo "CKL_RATIONALE=No GNOME/desktop packages, dconf user profile, or media-keys schema present. Rule applies only when a graphical user interface is installed."
+  exit 0
 elif [ "$GSETTINGS_RC" -ne 0 ]; then
-  STATUS="Open"
-  RATIONALE="GUI indicators present but gsettings could not read ${SCHEMA} ${KEY} (rc=${GSETTINGS_RC}). Key is missing or schema unavailable."
+  echo "[FAIL] GUI indicators present but gsettings could not read ${SCHEMA} ${KEY}."
+  echo "CKL_STATUS=Open"
+  echo "CKL_RATIONALE=GUI indicators present but gsettings could not read ${SCHEMA} ${KEY} (rc=${GSETTINGS_RC}). Key is missing or schema unavailable."
+  exit 1
 elif [ "$NORMALIZED" = "@as[]" ] || [ "$NORMALIZED" = "[]" ] || [ "$NORMALIZED" = "@as['']" ]; then
-  STATUS="Not a Finding"
-  RATIONALE="gsettings reports logout is unbound (${GSETTINGS_RAW}). Ctrl-Alt-Delete graphical binding is disabled."
+  echo "[SUCCESS] logout key is unbound."
+  echo "CKL_STATUS=Not a Finding"
+  echo "CKL_RATIONALE=gsettings reports logout is unbound (${GSETTINGS_RAW}). Ctrl-Alt-Delete graphical binding is disabled."
+  exit 0
 else
-  STATUS="Open"
-  RATIONALE="logout key is bound to an action: ${GSETTINGS_RAW}. STIG requires an empty array (@as [])."
-fi
-
-printf 'HOST_FQDN=%s\n' "$HOST_FQDN"
-printf 'HOST_SHORT=%s\n' "$HOST_SHORT"
-printf 'OS_PRETTY=%s\n' "$OS_PRETTY"
-printf 'GUI_PRESENT=%s\n' "$GUI_PRESENT"
-printf 'GNOME_PKGS=%s\n' "${GNOME_PKGS:-none}"
-printf 'DCONF_PROFILE_EXISTS=%s\n' "$DCONF_PROFILE_EXISTS"
-printf 'GSETTINGS_BIN=%s\n' "${GSETTINGS_BIN:-none}"
-printf 'SCHEMA_PRESENT=%s\n' "$SCHEMA_PRESENT"
-printf 'GSETTINGS_RAW=%s\n' "$GSETTINGS_RAW"
-printf 'GSETTINGS_RC=%s\n' "$GSETTINGS_RC"
-printf 'STATUS=%s\n' "$STATUS"
-printf 'RATIONALE=%s\n' "$RATIONALE"
-EOS
-)
-
-run_remote() {
-  if [ -n "$SSH_TARGET" ]; then
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-      "${SSH_OPTS[@]}" "$SSH_TARGET" "bash -s" <<<"$REMOTE_SCRIPT"
-  else
-    bash -c "$REMOTE_SCRIPT"
-  fi
-}
-
-if ! RESULT=$(run_remote); then
-  echo "[ERROR] Failed to execute check on ${SSH_TARGET:-localhost}. Check SSH credentials/connectivity or local privileges." >&2
+  echo "[FAIL] logout key is bound to an action."
+  echo "CKL_STATUS=Open"
+  echo "CKL_RATIONALE=logout key is bound to an action: ${GSETTINGS_RAW}. STIG requires an empty array (@as [])."
   exit 1
 fi
+EOF
 
-get_field() {
-  printf '%s\n' "$RESULT" | awk -F= -v k="$1" '$1==k {sub(/^[^=]+=/,""); print; exit}'
-}
+echo "[INFO] Staging verification payload to s3://${BUCKET_NAME}/${S3_KEY}..." >&2
+aws s3 cp "$LOCAL_TMP_SCRIPT" "s3://${BUCKET_NAME}/${S3_KEY}" --region "$REGION" >/dev/null
 
-HOST_FQDN=$(get_field HOST_FQDN)
-HOST_SHORT=$(get_field HOST_SHORT)
-OS_PRETTY=$(get_field OS_PRETTY)
-GUI_PRESENT=$(get_field GUI_PRESENT)
-GNOME_PKGS=$(get_field GNOME_PKGS)
-DCONF_PROFILE_EXISTS=$(get_field DCONF_PROFILE_EXISTS)
-GSETTINGS_BIN=$(get_field GSETTINGS_BIN)
-SCHEMA_PRESENT=$(get_field SCHEMA_PRESENT)
-GSETTINGS_RAW=$(get_field GSETTINGS_RAW)
-GSETTINGS_RC=$(get_field GSETTINGS_RC)
-STATUS=$(get_field STATUS)
-RATIONALE=$(get_field RATIONALE)
+echo "[INFO] Streaming remote verification on $INSTANCE_ID ($HOSTNAME_TAG) via SSM..." >&2
 
-TARGET_LABEL="${SSH_TARGET:-localhost}"
+ONE_LINER="aws s3 cp s3://${BUCKET_NAME}/${S3_KEY} - --region ${REGION} | bash"
+
+COMMAND_ID=$(aws ssm send-command \
+  --region "$REGION" \
+  --instance-ids "$INSTANCE_ID" \
+  --document-name "AWS-RunShellScript" \
+  --comment "Verify STIG V-270711 (Ctrl-Alt-Delete GUI binding)" \
+  --parameters "commands=[\"$ONE_LINER\"]" \
+  --query "Command.CommandId" \
+  --output text)
+
+STATUS="Pending"
+MAX_ATTEMPTS=15
+ATTEMPT=0
+
+while [[ "$STATUS" == "Pending" || "$STATUS" == "InProgress" || "$STATUS" == "Delayed" ]]; do
+  ATTEMPT=$((ATTEMPT + 1))
+  if [ "$ATTEMPT" -gt "$MAX_ATTEMPTS" ]; then
+    echo "[ERROR] Timed out waiting for SSM command on $INSTANCE_ID." >&2
+    exit 1
+  fi
+  sleep 2
+  STATUS=$(aws ssm get-command-invocation \
+    --region "$REGION" \
+    --command-id "$COMMAND_ID" \
+    --instance-id "$INSTANCE_ID" \
+    --query "Status" \
+    --output text 2>/dev/null || echo "Pending")
+done
+
+RAW_OUTPUT=$(aws ssm get-command-invocation \
+  --region "$REGION" \
+  --command-id "$COMMAND_ID" \
+  --instance-id "$INSTANCE_ID" \
+  --query "StandardOutputContent" \
+  --output text 2>/dev/null || echo "")
+
+STD_ERR=$(aws ssm get-command-invocation \
+  --region "$REGION" \
+  --command-id "$COMMAND_ID" \
+  --instance-id "$INSTANCE_ID" \
+  --query "StandardErrorContent" \
+  --output text 2>/dev/null || echo "")
+
+CKL_STATUS=$(printf '%s\n' "$RAW_OUTPUT" | awk -F= '/^CKL_STATUS=/{print $2; exit}')
+CKL_RATIONALE=$(printf '%s\n' "$RAW_OUTPUT" | awk -F= '/^CKL_RATIONALE=/{sub(/^[^=]+=/,""); print; exit}')
+
+if [ -z "$CKL_STATUS" ]; then
+  if [ "$STATUS" = "Success" ]; then
+    CKL_STATUS="Not a Finding"
+    CKL_RATIONALE="SSM command succeeded but CKL markers were missing. Review raw output."
+  else
+    CKL_STATUS="Open"
+    CKL_RATIONALE="Remote SSM verification failed on host '$HOSTNAME_TAG' ($INSTANCE_ID). SSM status=$STATUS."
+  fi
+fi
 
 echo "================================================================================"
 echo "STIG ID: UBTU-24-300025 | Vulnerability ID: V-270711 | Rule: SV-270711r1184069"
@@ -159,21 +197,21 @@ echo "Execution Date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo "================================================================================"
 echo ""
 echo "--- COPY INTO 'FINDING DETAILS' ---"
-echo "Target (SSH/local):     $TARGET_LABEL"
-echo "Hostname (FQDN):        $HOST_FQDN"
-echo "Hostname (short):       $HOST_SHORT"
-echo "OS:                     $OS_PRETTY"
-echo "GUI present:            $GUI_PRESENT"
-echo "Installed GNOME pkgs:   $GNOME_PKGS"
-echo "dconf profile exists:   $DCONF_PROFILE_EXISTS"
-echo "gsettings binary:       $GSETTINGS_BIN"
-echo "media-keys schema:      $SCHEMA_PRESENT"
-echo "gsettings command:      gsettings get org.gnome.settings-daemon.plugins.media-keys logout"
-echo "gsettings result:       $GSETTINGS_RAW"
-echo "gsettings exit code:    $GSETTINGS_RC"
-echo "Expected compliant:     @as []"
+echo "Target Hostname Tag: $HOSTNAME_TAG"
+echo "Target Instance ID:  $INSTANCE_ID"
+echo "AWS Region:          $REGION"
+echo "SSM Command ID:      $COMMAND_ID"
+echo "SSM Status:          $STATUS"
+echo ""
+echo "Remote SSM Verification Output:"
+echo "$RAW_OUTPUT"
+if [ -n "$STD_ERR" ] && [ "$STD_ERR" != "None" ]; then
+  echo ""
+  echo "SSM StandardError:"
+  echo "$STD_ERR"
+fi
 echo ""
 echo "--- COPY INTO 'COMMENTS' ---"
-echo "STATUS: $STATUS"
-echo "COMMENT: Remote/local audit of V-270711 on host '$HOST_FQDN' ($TARGET_LABEL). $RATIONALE"
+echo "STATUS: $CKL_STATUS"
+echo "COMMENT: Remote SSM audit of V-270711 on host '$HOSTNAME_TAG' ($INSTANCE_ID / $REGION). ${CKL_RATIONALE:-See raw output.}"
 echo "================================================================================"
